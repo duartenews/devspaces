@@ -91,6 +91,24 @@ Fonte da verdade: `~/.config/dev-workspaces/workspaces.json` (editado pelo app; 
 | `build.zsh` | compila e monta `~/Applications/DevSpaces.app` |
 | `SPEC.md` | especificação completa |
 
+## Assinatura estável (permissão de Acessibilidade que não cai)
+
+A permissão de Acessibilidade do macOS é amarrada à assinatura do app. Com assinatura ad-hoc (o fallback do `build.zsh`), cada recompilação invalida a permissão — o toggle continua ligado nos Ajustes, mas o sistema ignora. Para a permissão sobreviver a rebuilds, crie uma identidade local uma única vez:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes \
+  -subj "/CN=DevSpaces Signing" \
+  -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=critical,codeSigning" \
+  -addext "basicConstraints=critical,CA:false"
+openssl pkcs12 -export -out ds.p12 -inkey key.pem -in cert.pem -name "DevSpaces Signing" \
+  -passout pass:devspaces -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+security import ds.p12 -k ~/Library/Keychains/login.keychain-db -P devspaces -T /usr/bin/codesign
+security add-trusted-cert -p codeSign -k ~/Library/Keychains/login.keychain-db cert.pem
+```
+
+O `build.zsh` detecta a identidade "DevSpaces Signing" e passa a usá-la sozinho. Se a permissão ficar num estado inconsistente (toggle ligado mas app reclamando), zere e conceda de novo: `tccutil reset Accessibility com.raphael.devspaces`.
+
 ## Avisos
 
 - Caminhos ainda hardcoded para `/Users/Raphael` em alguns pontos — ajuste para o seu usuário ao instalar (busca e troca resolve).

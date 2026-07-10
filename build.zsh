@@ -72,7 +72,16 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-print "▶ assinando (ad-hoc)…"
-codesign --force --sign - "$APP_DIR"
+# Assinatura ESTÁVEL: com identidade fixa a permissão de Acessibilidade (TCC)
+# sobrevive a recompilações. Ad-hoc muda o hash a cada build e o macOS mostra
+# o toggle ligado mas ignora a permissão. Criar a identidade (uma vez):
+#   openssl req -x509 ... -subj "/CN=DevSpaces Signing" (ver README)
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "DevSpaces Signing"; then
+  print "▶ assinando (DevSpaces Signing)…"
+  codesign --force --sign "DevSpaces Signing" "$APP_DIR"
+else
+  print "▶ assinando (ad-hoc — permissões TCC caem a cada rebuild)…"
+  codesign --force --sign - "$APP_DIR"
+fi
 
 print "✔ pronto: $APP_DIR"
