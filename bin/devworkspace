@@ -1,0 +1,1242 @@
+#!/bin/zsh
+
+# DevSync-backed Ghostty workspaces. Each available project becomes one native
+# Ghostty tab. The panes inside that tab are declared with pane() below.
+
+emulate -LR zsh
+
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/bin:${PATH:-}:/usr/bin:/bin:/usr/sbin:/sbin"
+readonly DEVSYNC_PROJECTS_FILE="${DEVSYNC_PROJECTS_FILE:-$HOME/.devsync/projects}"
+readonly WORKSPACE_CONFIG="${DEVSYNC_WORKSPACE_CONFIG:-$HOME/.config/dev-workspaces/workspaces.zsh}"
+readonly GHOSTTY_APP="/Applications/Ghostty.app"
+readonly GHOSTTY_BIN="$GHOSTTY_APP/Contents/MacOS/ghostty"
+readonly OPEN_BIN="/usr/bin/open"
+readonly OSASCRIPT_BIN="/usr/bin/osascript"
+readonly SELF="${DEVSYNC_WORKSPACE_BIN:-$HOME/bin/devworkspace}"
+
+if [[ -n "${TMUX_BIN:-}" ]]; then
+  readonly TMUX_BIN
+elif [[ -x /opt/homebrew/bin/tmux ]]; then
+  readonly TMUX_BIN="/opt/homebrew/bin/tmux"
+else
+  readonly TMUX_BIN="tmux"
+fi
+
+tmux() {
+  command "$TMUX_BIN" "$@"
+}
+
+typeset -g DEFAULT_MODEL=""
+typeset -g AUTOSTART_AGENTS=0
+typeset -g CONFIG_ERROR=0
+typeset -gA WS_MODELS
+typeset -gA WS_COLORS
+typeset -gA WS_PANES
+typeset -gA PANE_DIRECTIONS
+typeset -gA PANE_PARENTS
+typeset -gA PANE_COMMANDS
+typeset -gA PANE_MODELS
+typeset -gA PANE_EFFORTS
+
+say_error() {
+  print -u2 -r -- "devworkspace: $*"
+}
+
+config_error() {
+  say_error "config: $*"
+  CONFIG_ERROR=1
+}
+
+valid_pane_name() {
+  [[ -n "$1" && "$1" != *$'\n'* && "$1" != *:* && "$1" != *,* ]]
+}
+
+valid_direction() {
+  case "$1" in
+    right|left|down|up) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# workspace <devsync-project> [model] [color]
+workspace() {
+  local project="$1"
+  local model="${2:-$DEFAULT_MODEL}"
+  local color="${3:-}"
+
+  if [[ -z "$project" ]]; then
+    config_error "workspace requires a DevSync project name"
+    return 0
+  fi
+  WS_MODELS[$project]="$model"
+  WS_COLORS[$project]="$color"
+  [[ -n "${WS_PANES[$project]:-}" ]] || WS_PANES[$project]="shell"
+}
+
+# root <project> <name> <command> [model] [effort]
+# Redefine o split raiz (primeiro terminal da aba). Sem esta linha o raiz é
+# um shell chamado "shell". Deve vir logo após `workspace`, antes dos `pane`.
+root() {
+  local project="$1"
+  local name="$2"
+  local command="${3:-shell}"
+  local model="${4:-}"
+  local effort="${5:-}"
+
+  if [[ -z "$project" ]] || ! valid_pane_name "$name"; then
+    config_error "root requires a project and a valid pane name"
+    return 0
+  fi
+  WS_PANES[$project]="$name"
+  PANE_COMMANDS["$project:$name"]="$command"
+  PANE_MODELS["$project:$name"]="$model"
+  PANE_EFFORTS["$project:$name"]="$effort"
+}
+
+# pane <project> <name> <right|left|down|up> <parent> <command> [model] [effort]
+pane() {
+  local project="$1"
+  local name="$2"
+  local direction="$3"
+  local parent="$4"
+  local command="$5"
+  local model="${6:-}"
+  local effort="${7:-}"
+  local current
+
+  if [[ -z "$project" ]] || ! valid_pane_name "$name" || ! valid_direction "$direction"; then
+    config_error "pane requires project, name, direction, parent pane, and command"
+    return 0
+  fi
+
+  current="${WS_PANES[$project]:-shell}"
+  if [[ ",$current," != *",$name,"* ]]; then
+    WS_PANES[$project]="$current,$name"
+  else
+    WS_PANES[$project]="$current"
+  fi
+  PANE_DIRECTIONS["$project:$name"]="$direction"
+  PANE_PARENTS["$project:$name"]="$parent"
+  PANE_COMMANDS["$project:$name"]="$command"
+  PANE_MODELS["$project:$name"]="$model"
+  PANE_EFFORTS["$project:$name"]="$effort"
+}
+
+load_config() {
+  DEFAULT_MODEL=""
+  AUTOSTART_AGENTS=0
+  CONFIG_ERROR=0
+  WS_MODELS=()
+  WS_COLORS=()
+  WS_PANES=()
+  PANE_DIRECTIONS=()
+  PANE_PARENTS=()
+  PANE_COMMANDS=()
+  PANE_MODELS=()
+  PANE_EFFORTS=()
+
+  if [[ ! -r "$WORKSPACE_CONFIG" ]]; then
+    say_error "missing preferences file: $WORKSPACE_CONFIG"
+    return 1
+  fi
+
+  source "$WORKSPACE_CONFIG"
+  (( CONFIG_ERROR == 0 ))
+}
+
+project_path() {
+  local wanted="$1"
+  local name path ignored
+
+  [[ -r "$DEVSYNC_PROJECTS_FILE" ]] || return 1
+  while IFS='|' read -r name path ignored; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    if [[ "$name" == "$wanted" ]]; then
+      print -r -- "$path"
+      return 0
+    fi
+  done < "$DEVSYNC_PROJECTS_FILE"
+  return 1
+}
+
+registered_project_names() {
+  local name path ignored
+
+  [[ -r "$DEVSYNC_PROJECTS_FILE" ]] || return 1
+  while IFS='|' read -r name path ignored; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    print -r -- "$name"
+  done < "$DEVSYNC_PROJECTS_FILE"
+}
+
+# Projects absent from this Mac are skipped, then included automatically as
+# soon as their configured DevSync path exists.
+project_names() {
+  local name path ignored
+
+  [[ -r "$DEVSYNC_PROJECTS_FILE" ]] || return 1
+  while IFS='|' read -r name path ignored; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    [[ -d "$path" ]] || continue
+    print -r -- "$name"
+  done < "$DEVSYNC_PROJECTS_FILE"
+}
+
+ensure_project() {
+  local project="$1"
+  local path
+
+  path="$(project_path "$project")" || {
+    say_error "project '$project' is not registered in DevSync"
+    return 1
+  }
+  if [[ ! -d "$path" ]]; then
+    say_error "project '$project' is not available locally: $path"
+    return 1
+  fi
+  print -r -- "$path"
+}
+
+workspace_model() {
+  print -r -- "${WS_MODELS[$1]:-$DEFAULT_MODEL}"
+}
+
+workspace_panes() {
+  print -r -- "${WS_PANES[$1]:-shell}"
+}
+
+pane_direction() {
+  print -r -- "${PANE_DIRECTIONS["$1:$2"]:-root}"
+}
+
+pane_parent() {
+  print -r -- "${PANE_PARENTS["$1:$2"]:-shell}"
+}
+
+pane_command() {
+  print -r -- "${PANE_COMMANDS["$1:$2"]:-shell}"
+}
+
+pane_model() {
+  print -r -- "${PANE_MODELS["$1:$2"]:-$(workspace_model "$1")}"
+}
+
+pane_effort() {
+  print -r -- "${PANE_EFFORTS["$1:$2"]:-}"
+}
+
+safe_id() {
+  local value="$1"
+  value="${value//[^A-Za-z0-9_.-]/-}"
+  print -r -- "$value"
+}
+
+pane_session_name() {
+  print -r -- "ghostty-$(safe_id "$1")-$(safe_id "$2")"
+}
+
+shell_command() {
+  local item
+  local -a quoted
+  for item in "$@"; do
+    quoted+=("${(q)item}")
+  done
+  print -r -- "${(j: :)quoted}"
+}
+
+# Maps the short agent names used in the preferences file to a real launch
+# command. Any other command string is executed as-is.
+launch_for() {
+  local command="$1"
+  local model="$2"
+  local effort="$3"
+
+  case "$command" in
+    claude)
+      print -r -- "claude${model:+ --model ${(q)model}}${effort:+ --effort ${(q)effort}}"
+      ;;
+    codex|codex2)
+      print -r -- "$command${model:+ -m ${(q)model}}${effort:+ -c model_reasoning_effort=${(q)effort}}"
+      ;;
+    *) print -r -- "$command" ;;
+  esac
+}
+
+# Agent panes exec straight into the agent so it owns the pty (agents may kill
+# their whole process group on exit). The tmux pane has remain-on-exit plus a
+# pane-died respawn hook, so when the agent exits this command runs again and
+# the pane is back at the launcher banner. Without autostart the pane waits
+# for ENTER, so a full Ghostty bootstrap does not start one agent per split.
+agent_pane_exec() {
+  local project="$1"
+  local pane_name="$2"
+  local model="$3"
+  local launch="$4"
+  local model_part=""
+
+  trap 'print; exec /bin/zsh -l' INT
+  if (( AUTOSTART_AGENTS == 0 )); then
+    print
+    [[ -n "$model" ]] && model_part=" · %F{yellow}modelo: ${model}%f"
+    print -P "%F{blue}◆ ${project}%f · ${pane_name}${model_part}"
+    print -P "%F{8}  ENTER  → inicia: ${launch}%f"
+    print -P "%F{8}  Ctrl-C → shell normal neste pane%f"
+    if ! read -r; then
+      print
+      exec /bin/zsh -l
+    fi
+  fi
+  exec /bin/zsh -lic "$launch"
+}
+
+cmd_run_pane() {
+  local project="$1"
+  local pane_name="$2"
+  local path model effort command title
+
+  load_config || return 1
+  path="$(ensure_project "$project")" || return 1
+  model="$(pane_model "$project" "$pane_name")"
+  effort="$(pane_effort "$project" "$pane_name")"
+  command="$(pane_command "$project" "$pane_name")"
+  title="$project"
+
+  cd "$path" || return 1
+  export WORKSPACE_NAME="$project"
+  export WORKSPACE_PANE="$pane_name"
+  export WORKSPACE_MODEL="$model"
+  export WORKSPACE_EFFORT="$effort"
+  printf '\033]0;%s\007' "$title"
+
+  case "$command" in
+    ""|shell)
+      exec /bin/zsh -l
+      ;;
+    claude|codex|codex2)
+      agent_pane_exec "$project" "$pane_name" "$model" "$(launch_for "$command" "$model" "$effort")"
+      ;;
+    *)
+      exec /bin/zsh -lic "$command"
+      ;;
+  esac
+}
+
+# --- Usage meters -----------------------------------------------------------
+# Each agent pane shows how much of the provider's 5h/weekly rate limit is
+# used, straight in the tmux status line. Values are cached briefly so many
+# panes share one lookup.
+
+readonly USAGE_CACHE_DIR="${TMPDIR:-/tmp}/devworkspace-usage-$USER"
+readonly USAGE_TTL=60
+readonly PYTHON_BIN="/usr/bin/python3"
+
+usage_provider_for_command() {
+  case "$1" in
+    claude) print -r -- "claude" ;;
+    codex) print -r -- "codex" ;;
+    codex2) print -r -- "codex2" ;;
+    *) print -r -- "" ;;
+  esac
+}
+
+claude_oauth_token() {
+  local token="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+
+  if [[ -z "$token" ]]; then
+    token="$(/usr/bin/security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null \
+      | "$PYTHON_BIN" -c 'import json,sys;print(json.load(sys.stdin)["claudeAiOauth"]["accessToken"])' 2>/dev/null)"
+  fi
+  if [[ -z "$token" && -r "$HOME/.claude/.credentials.json" ]]; then
+    token="$("$PYTHON_BIN" -c 'import json;print(json.load(open("'"$HOME"'/.claude/.credentials.json"))["claudeAiOauth"]["accessToken"])' 2>/dev/null)"
+  fi
+  [[ -n "$token" ]] || return 1
+  print -r -- "$token"
+}
+
+# Prints "<5h%> <7d%>" for the Claude Code account.
+usage_pcts_claude() {
+  local token
+
+  token="$(claude_oauth_token)" || return 1
+  /usr/bin/curl -sS --max-time 8 https://api.anthropic.com/api/oauth/usage \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null \
+    | "$PYTHON_BIN" -c '
+import json, sys
+d = json.load(sys.stdin)
+print(round(d["five_hour"]["utilization"]), round(d["seven_day"]["utilization"]))' 2>/dev/null
+}
+
+# Prints "<5h%> <7d%>" for a Codex home dir, reading the newest session file
+# that recorded rate limits. Windows that already reset report 0.
+usage_pcts_codex() {
+  local home="$1"
+  local f line=""
+  local -a files
+
+  files=("$home"/sessions/**/*.jsonl(N.om[1,8]))
+  for f in "${files[@]}"; do
+    line="$(grep '"rate_limits"' "$f" 2>/dev/null | tail -1)"
+    [[ -n "$line" ]] && break
+  done
+  [[ -n "$line" ]] || return 1
+  print -r -- "$line" | "$PYTHON_BIN" -c '
+import json, sys, time
+
+def find(o):
+    if isinstance(o, dict):
+        if "rate_limits" in o and isinstance(o["rate_limits"], dict):
+            return o["rate_limits"]
+        for v in o.values():
+            r = find(v)
+            if r is not None:
+                return r
+    elif isinstance(o, list):
+        for v in o:
+            r = find(v)
+            if r is not None:
+                return r
+    return None
+
+def pct(w):
+    # Janela ausente/desconhecida vira 0 para manter o contrato de saída
+    # "<n> <n>" que a barra tmux, o picker e o app DevSpaces esperam.
+    if not isinstance(w, dict):
+        return 0
+    resets = w.get("resets_at") or 0
+    if resets and resets < time.time():
+        return 0
+    p = w.get("used_percent")
+    return round(p) if p is not None else 0
+
+rl = find(json.loads(sys.stdin.readline()))
+if rl is None:
+    sys.exit(1)
+print(pct(rl.get("primary")), pct(rl.get("secondary")))' 2>/dev/null
+}
+
+usage_color() {
+  local pct="$1"
+  if [[ "$pct" != <-> ]]; then print -r -- "#6c7086"
+  elif (( pct >= 80 )); then print -r -- "#f38ba8"
+  elif (( pct >= 50 )); then print -r -- "#f9e2af"
+  else print -r -- "#a6e3a1"
+  fi
+}
+
+usage_render() {
+  local label="$1" p5="$2" p7="$3"
+  print -r -- "#[fg=#6c7086]${label}#[default] #[fg=$(usage_color "$p5")]${p5}%#[default]#[fg=#6c7086] 5h ·#[default] #[fg=$(usage_color "$p7")]${p7}%#[default]#[fg=#6c7086] 7d#[default]"
+}
+
+usage_pcts_for() {
+  case "$1" in
+    claude) usage_pcts_claude ;;
+    codex) usage_pcts_codex "$HOME/.codex-personal" ;;
+    codex2) usage_pcts_codex "$HOME/.codex-work" ;;
+    *) return 1 ;;
+  esac
+}
+
+usage_label_for() {
+  case "$1" in
+    claude) print -r -- "claude" ;;
+    codex) print -r -- "codex" ;;
+    codex2) print -r -- "codex-w" ;;
+  esac
+}
+
+# Cached "<5h%> <7d%>" for one provider — shared by the tmux status line, the
+# picker and the DevSpaces app. On temporary fetch failure (rate limit) the
+# last good value is kept and retried next cycle.
+usage_pcts_cached() {
+  local provider="$1"
+  local cache="$USAGE_CACHE_DIR/$provider.pcts" pcts now mtime
+
+  mkdir -p "$USAGE_CACHE_DIR" 2>/dev/null
+  if [[ -f "$cache" ]]; then
+    now="$(date +%s)"
+    mtime="$(stat -f %m "$cache" 2>/dev/null || print 0)"
+    if (( now - mtime < USAGE_TTL )); then
+      cat "$cache"
+      return 0
+    fi
+  fi
+
+  if pcts="$(usage_pcts_for "$provider")" && [[ -n "$pcts" ]]; then
+    print -r -- "$pcts" > "$cache"
+    print -r -- "$pcts"
+    return 0
+  fi
+  if [[ -s "$cache" ]]; then
+    touch "$cache"
+    cat "$cache"
+    return 0
+  fi
+  return 1
+}
+
+# tmux-formatted usage line for one provider.
+usage_cached() {
+  local provider="$1" pcts
+
+  if pcts="$(usage_pcts_cached "$provider")"; then
+    usage_render "$(usage_label_for "$provider")" ${=pcts}
+  else
+    usage_render "$(usage_label_for "$provider")" "?" "?"
+  fi
+}
+
+cmd_usage() {
+  local provider="${1:-}" pcts p
+
+  if [[ -n "$provider" ]]; then
+    usage_cached "$provider"
+    return 0
+  fi
+  for p in claude codex codex2; do
+    if pcts="$(usage_pcts_cached "$p")"; then
+      printf '%-8s 5h %s%%   7d %s%%\n' "$(usage_label_for "$p")" ${=pcts}
+    else
+      printf '%-8s (sem dados)\n' "$(usage_label_for "$p")"
+    fi
+  done
+}
+
+# Per-session tmux status line: workspace · pane · model on the left, the
+# matching provider usage meter (or all meters, for plain shells) on the right.
+apply_pane_status() {
+  local project="$1"
+  local pane_name="$2"
+  local session="$3"
+  local command model provider right
+
+  command="$(pane_command "$project" "$pane_name")"
+  model="$(pane_model "$project" "$pane_name")"
+  provider="$(usage_provider_for_command "$command")"
+  local effort="$(pane_effort "$project" "$pane_name")"
+  [[ -n "$effort" ]] && model="${model:+$model·}$effort"
+  local ws_color="${WS_COLORS[$project]:-#cdd6f4}"
+  [[ -n "$ws_color" ]] || ws_color="#cdd6f4"
+
+  if [[ -n "$provider" ]]; then
+    right="#($SELF usage $provider)"
+    # Agent exits leave the pane alive and relaunch the pane command, which
+    # shows the launcher banner again.
+    tmux set-option -w -t "$session" remain-on-exit on 2>/dev/null
+    tmux set-hook -t "$session" pane-died "respawn-pane -k" 2>/dev/null
+  else
+    right="#($SELF usage claude)  #($SELF usage codex)"
+  fi
+
+  tmux set-option -t "$session" status-left "#[bold,fg=$ws_color] $project #[fg=#89b4fa]$pane_name#[default]${model:+ #[fg=#a6adc8]$model#[default]} " 2>/dev/null
+  tmux set-option -t "$session" status-right "$right #[fg=#a6adc8]%H:%M #[default]" 2>/dev/null
+  tmux set-option -t "$session" status-left-length 60 2>/dev/null
+  tmux set-option -t "$session" status-right-length 120 2>/dev/null
+  tmux set-option -t "$session" status-interval 30 2>/dev/null
+}
+
+ensure_pane_session() {
+  local project="$1"
+  local pane_name="$2"
+  local path session command
+
+  path="$(ensure_project "$project")" || return 1
+  session="$(pane_session_name "$project" "$pane_name")"
+  if tmux has-session -t "$session" 2>/dev/null; then
+    apply_pane_status "$project" "$pane_name" "$session"
+    return 0
+  fi
+
+  command="$(shell_command "$SELF" run-pane "$project" "$pane_name")"
+  tmux new-session -d -s "$session" -n "$pane_name" -c "$path" "$command" || {
+    say_error "could not create tmux pane '$pane_name' for '$project'"
+    return 1
+  }
+  apply_pane_status "$project" "$pane_name" "$session"
+}
+
+ensure_project_sessions() {
+  local project="$1"
+  local pane_name failed=0
+
+  for pane_name in ${(s:,:)$(workspace_panes "$project")}; do
+    ensure_pane_session "$project" "$pane_name" || failed=1
+  done
+  return "$failed"
+}
+
+ensure_workspace_sessions() {
+  local project
+  local failed=0
+
+  for project in "${(@f)$(project_names)}"; do
+    ensure_project_sessions "$project" || failed=1
+  done
+  return "$failed"
+}
+
+cmd_attach_pane() {
+  local project="$1"
+  local pane_name="$2"
+  local session
+
+  load_config || return 1
+  ensure_pane_session "$project" "$pane_name" || return 1
+  session="$(pane_session_name "$project" "$pane_name")"
+  printf '\033]0;%s\007' "$project"
+  exec tmux attach-session -t "$session"
+}
+
+# Adds configured splits to the currently selected Ghostty tab. The root pane
+# already exists because it is running this bootstrap command.
+add_splits_to_current_tab() {
+  local project="$1"
+  local pane_name direction parent path command parent_index root_name index=1
+  local -A pane_indexes
+  local -a args panes
+
+  path="$(ensure_project "$project")" || return 1
+  panes=("${(s:,:)$(workspace_panes "$project")}")
+  root_name="${panes[1]:-shell}"
+  args=("$path")
+  pane_indexes[$root_name]=1
+  for pane_name in "${panes[@]}"; do
+    [[ "$pane_name" == "$root_name" ]] && continue
+    direction="$(pane_direction "$project" "$pane_name")"
+    parent="$(pane_parent "$project" "$pane_name")"
+    parent_index="${pane_indexes[$parent]:-}"
+    if [[ -z "$parent_index" ]]; then
+      say_error "pane '$pane_name' in '$project' references unknown parent '$parent'"
+      return 1
+    fi
+    command="$(shell_command "$SELF" attach-pane "$project" "$pane_name")"
+    (( index += 1 ))
+    pane_indexes[$pane_name]="$index"
+    args+=("$direction" "$command" "$parent_index")
+  done
+
+  (( ${#args[@]} == 1 )) && return 0
+  "$OSASCRIPT_BIN" \
+    -e 'on run argv' \
+    -e 'set workspacePath to item 1 of argv' \
+    -e 'tell application "Ghostty"' \
+    -e 'set targetTab to selected tab of front window' \
+    -e 'set primaryTerminal to first terminal of targetTab' \
+    -e 'set terminalList to {primaryTerminal}' \
+    -e 'set itemIndex to 2' \
+    -e 'repeat while itemIndex <= (count of argv)' \
+    -e 'set directionName to item itemIndex of argv' \
+    -e 'set paneCommand to item (itemIndex + 1) of argv' \
+    -e 'set parentIndex to (item (itemIndex + 2) of argv) as integer' \
+    -e 'set targetTerminal to item parentIndex of terminalList' \
+    -e 'set paneConfig to new surface configuration' \
+    -e 'set initial working directory of paneConfig to workspacePath' \
+    -e 'set command of paneConfig to paneCommand' \
+    -e 'if directionName is "right" then' \
+    -e 'set newTerminal to split targetTerminal direction right with configuration paneConfig' \
+    -e 'else if directionName is "left" then' \
+    -e 'set newTerminal to split targetTerminal direction left with configuration paneConfig' \
+    -e 'else if directionName is "down" then' \
+    -e 'set newTerminal to split targetTerminal direction down with configuration paneConfig' \
+    -e 'else if directionName is "up" then' \
+    -e 'set newTerminal to split targetTerminal direction up with configuration paneConfig' \
+    -e 'end if' \
+    -e 'set end of terminalList to newTerminal' \
+    -e 'set itemIndex to itemIndex + 3' \
+    -e 'end repeat' \
+    -e 'if (count of argv) > 2 then perform action "equalize_splits" on primaryTerminal' \
+    -e 'focus primaryTerminal' \
+    -e 'end tell' \
+    -e 'end run' \
+    -- "${args[@]}"
+}
+
+# Creates one native Ghostty tab for a project plus its configured splits.
+create_workspace_tab() {
+  local project="$1"
+  local pane_name direction parent path root_command pane_command parent_index root_name index=1
+  local -A pane_indexes
+  local -a args panes
+
+  path="$(ensure_project "$project")" || return 1
+  panes=("${(s:,:)$(workspace_panes "$project")}")
+  root_name="${panes[1]:-shell}"
+  root_command="$(shell_command "$SELF" attach-pane "$project" "$root_name")"
+  args=("$path" "$root_command")
+  pane_indexes[$root_name]=1
+  for pane_name in "${panes[@]}"; do
+    [[ "$pane_name" == "$root_name" ]] && continue
+    direction="$(pane_direction "$project" "$pane_name")"
+    parent="$(pane_parent "$project" "$pane_name")"
+    parent_index="${pane_indexes[$parent]:-}"
+    if [[ -z "$parent_index" ]]; then
+      say_error "pane '$pane_name' in '$project' references unknown parent '$parent'"
+      return 1
+    fi
+    pane_command="$(shell_command "$SELF" attach-pane "$project" "$pane_name")"
+    (( index += 1 ))
+    pane_indexes[$pane_name]="$index"
+    args+=("$direction" "$pane_command" "$parent_index")
+  done
+
+  "$OSASCRIPT_BIN" \
+    -e 'on run argv' \
+    -e 'set workspacePath to item 1 of argv' \
+    -e 'set rootCommand to item 2 of argv' \
+    -e 'tell application "Ghostty"' \
+    -e 'set targetWindow to front window' \
+    -e 'set rootConfig to new surface configuration' \
+    -e 'set initial working directory of rootConfig to workspacePath' \
+    -e 'set command of rootConfig to rootCommand' \
+    -e 'set targetTab to new tab in targetWindow with configuration rootConfig' \
+    -e 'set primaryTerminal to first terminal of targetTab' \
+    -e 'set terminalList to {primaryTerminal}' \
+    -e 'set itemIndex to 3' \
+    -e 'repeat while itemIndex <= (count of argv)' \
+    -e 'set directionName to item itemIndex of argv' \
+    -e 'set paneCommand to item (itemIndex + 1) of argv' \
+    -e 'set parentIndex to (item (itemIndex + 2) of argv) as integer' \
+    -e 'set targetTerminal to item parentIndex of terminalList' \
+    -e 'set paneConfig to new surface configuration' \
+    -e 'set initial working directory of paneConfig to workspacePath' \
+    -e 'set command of paneConfig to paneCommand' \
+    -e 'if directionName is "right" then' \
+    -e 'set newTerminal to split targetTerminal direction right with configuration paneConfig' \
+    -e 'else if directionName is "left" then' \
+    -e 'set newTerminal to split targetTerminal direction left with configuration paneConfig' \
+    -e 'else if directionName is "down" then' \
+    -e 'set newTerminal to split targetTerminal direction down with configuration paneConfig' \
+    -e 'else if directionName is "up" then' \
+    -e 'set newTerminal to split targetTerminal direction up with configuration paneConfig' \
+    -e 'end if' \
+    -e 'set end of terminalList to newTerminal' \
+    -e 'set itemIndex to itemIndex + 3' \
+    -e 'end repeat' \
+    -e 'if (count of argv) > 2 then perform action "equalize_splits" on primaryTerminal' \
+    -e 'focus primaryTerminal' \
+    -e 'end tell' \
+    -e 'end run' \
+    -- "${args[@]}"
+}
+
+# Every pane sets the terminal title to the project name, so the Ghostty tab
+# is named after the workspace. Returns 0 when an open tab was focused.
+focus_workspace_tab() {
+  local project="$1"
+  local result
+
+  result="$("$OSASCRIPT_BIN" \
+    -e 'on run argv' \
+    -e 'set wanted to item 1 of argv' \
+    -e 'tell application "Ghostty"' \
+    -e 'if (count of windows) is 0 then return "missing"' \
+    -e 'repeat with theTab in tabs of front window' \
+    -e 'if (name of theTab as text) is wanted then' \
+    -e 'select tab theTab' \
+    -e 'return "focused"' \
+    -e 'end if' \
+    -e 'end repeat' \
+    -e 'end tell' \
+    -e 'return "missing"' \
+    -e 'end run' \
+    -- "$project" 2>/dev/null)"
+  [[ "$result" == "focused" ]]
+}
+
+# Newline-separated titles of the open Ghostty tabs (used by the picker).
+open_tab_names() {
+  "$OSASCRIPT_BIN" \
+    -e 'set out to ""' \
+    -e 'tell application "Ghostty"' \
+    -e 'if (count of windows) is 0 then return ""' \
+    -e 'repeat with theTab in tabs of front window' \
+    -e 'set out to out & (name of theTab as text) & linefeed' \
+    -e 'end repeat' \
+    -e 'end tell' \
+    -e 'return out' 2>/dev/null
+}
+
+ghostty_window_count() {
+  "$OSASCRIPT_BIN" -e 'tell application "Ghostty" to count of windows' 2>/dev/null || print 0
+}
+
+# Garante que existe uma janela do Ghostty para receber a aba (abre o app e
+# espera a janela aparecer, se preciso).
+ensure_ghostty_window() {
+  local tries=0
+
+  if (( $(ghostty_window_count) > 0 )); then
+    return 0
+  fi
+  "$OPEN_BIN" -a Ghostty 2>/dev/null || return 1
+  while (( tries < 40 )); do
+    (( $(ghostty_window_count) > 0 )) && return 0
+    sleep 0.25
+    (( tries += 1 ))
+  done
+  say_error "o Ghostty não abriu nenhuma janela"
+  return 1
+}
+
+# Opens one workspace as a native Ghostty tab (or focuses it if already open).
+cmd_open_ws() {
+  local project="$1"
+
+  if [[ -z "$project" ]]; then
+    say_error "uso: devworkspace ws <projeto>"
+    return 1
+  fi
+  ensure_project "$project" >/dev/null || return 1
+  ensure_project_sessions "$project" || true
+  ensure_ghostty_window || return 1
+  focus_workspace_tab "$project" && return 0
+  create_workspace_tab "$project"
+}
+
+pane_summary() {
+  local project="$1"
+  local pane_name command model
+  local -a parts
+
+  for pane_name in ${(s:,:)$(workspace_panes "$project")}; do
+    command="$(pane_command "$project" "$pane_name")"
+    model="$(pane_model "$project" "$pane_name")"
+    case "$command" in
+      shell) parts+=("shell") ;;
+      claude|codex|codex2) parts+=("$command${model:+:$model}") ;;
+      *) parts+=("$pane_name") ;;
+    esac
+  done
+  print -r -- "${(j: · :)parts}"
+}
+
+strip_tmux_fmt() {
+  sed -E 's/#\[[^]]*\]//g'
+}
+
+render_picker() {
+  local -a projects open_tabs
+  local project pdir state summary i=0 n_panes
+
+  projects=("$@")
+  open_tabs=("${(@f)$(open_tab_names)}")
+
+  print -n '\033[2J\033[H'
+  print
+  print -P "  %B%F{blue}WORKSPACES%f%b  %F{8}(DevSync · Ghostty)%f"
+  print
+  for project in "${projects[@]}"; do
+    (( i += 1 ))
+    pdir="$(project_path "$project")"
+    n_panes="${#${(s:,:)$(workspace_panes "$project")}}"
+    summary="$(pane_summary "$project")"
+    if [[ ! -d "$pdir" ]]; then
+      print -P "  %F{8}$i%f  %F{8}${(r:18:)project} ○ não está neste Mac%f"
+      continue
+    fi
+    if (( ${open_tabs[(Ie)$project]} )); then
+      state="%F{green}● aberto%f"
+    elif tmux has-session -t "$(pane_session_name "$project" shell)" 2>/dev/null; then
+      state="%F{yellow}◌ em segundo plano%f"
+    else
+      state="%F{8}○ fechado%f"
+    fi
+    print -P "  %F{cyan}%B$i%b%f  ${(r:18:)project} $state"
+    print -P "     %F{8}$n_panes splits: $summary%f"
+  done
+  print
+  print -P "  %F{8}uso agora:%f"
+  print -r -- "     $(usage_cached claude | strip_tmux_fmt)"
+  print -r -- "     $(usage_cached codex | strip_tmux_fmt)"
+  print
+  print -P "  %F{8}[1-$i] abrir workspace · [a] abrir todos · [r] atualizar · [s] sair pro shell%f"
+}
+
+# The launcher tab: Ghostty opens on this menu and each workspace only starts
+# when picked. Stays alive as tab 1, like a workspace sidebar.
+cmd_picker() {
+  local key idx project pdir
+  local -a projects
+
+  load_config || exec /bin/zsh -l
+  printf '\033]0;workspaces\007'
+  trap 'exec /bin/zsh -l' INT
+  cleanup_stale_sessions 2>/dev/null
+
+  while true; do
+    projects=("${(@f)$(registered_project_names)}")
+    render_picker "${projects[@]}"
+    read -k1 -s key || exec /bin/zsh -l
+    case "$key" in
+      [1-9])
+        idx="$key"
+        project="${projects[idx]:-}"
+        [[ -n "$project" ]] || continue
+        pdir="$(project_path "$project")"
+        if [[ ! -d "$pdir" ]]; then
+          print -P "\n  %F{red}'$project' não está disponível neste Mac.%f"
+          sleep 1
+          continue
+        fi
+        cmd_open_ws "$project" || sleep 1
+        ;;
+      a|A)
+        for project in "${(@f)$(project_names)}"; do
+          cmd_open_ws "$project" || true
+        done
+        ;;
+      s|S|q|Q)
+        print
+        exec /bin/zsh -l
+        ;;
+      u|U)
+        rm -f "$USAGE_CACHE_DIR"/* 2>/dev/null
+        ;;
+      *) ;;
+    esac
+  done
+}
+
+# Kills leftover ghostty-* tmux sessions whose project/pane pair no longer
+# exists in the preferences file (e.g. after renaming panes).
+cleanup_stale_sessions() {
+  local project pane_name session
+  local -A expected
+  local -a sessions
+
+  for project in "${(@f)$(project_names)}"; do
+    for pane_name in ${(s:,:)$(workspace_panes "$project")}; do
+      expected[$(pane_session_name "$project" "$pane_name")]=1
+    done
+  done
+
+  sessions=("${(@f)$(tmux list-sessions -F '#S' 2>/dev/null)}")
+  for session in "${sessions[@]}"; do
+    [[ "$session" == ghostty-* ]] || continue
+    [[ -n "${expected[$session]:-}" ]] && continue
+    tmux kill-session -t "$session" 2>/dev/null
+  done
+}
+
+cmd_bootstrap() {
+  local first_project project
+  local -a projects
+
+  load_config || return 1
+  projects=("${(@f)$(project_names)}")
+  if (( ${#projects[@]} == 0 )); then
+    exec /bin/zsh -l
+  fi
+
+  cleanup_stale_sessions
+  ensure_workspace_sessions || true
+  first_project="${projects[1]}"
+  add_splits_to_current_tab "$first_project" || say_error "could not add Ghostty splits for '$first_project'"
+  for project in "${(@)projects[2,-1]}"; do
+    create_workspace_tab "$project" || say_error "could not create Ghostty tab for '$project'"
+  done
+  local -a first_panes
+  first_panes=("${(s:,:)$(workspace_panes "$first_project")}")
+  exec "$SELF" attach-pane "$first_project" "${first_panes[1]:-shell}"
+}
+
+cmd_list() {
+  local project path state pane_name command model detail
+  local -a details
+
+  load_config || return 1
+  printf '%-20s %-11s %s\n' "WORKSPACE" "STATE" "PANES (comando · modelo)"
+  for project in "${(@f)$(registered_project_names)}"; do
+    path="$(project_path "$project")"
+    if [[ -d "$path" ]]; then
+      state="ready"
+    else
+      state="not-local"
+    fi
+    details=()
+    for pane_name in ${(s:,:)$(workspace_panes "$project")}; do
+      command="$(pane_command "$project" "$pane_name")"
+      model="$(pane_model "$project" "$pane_name")"
+      detail="$pane_name"
+      [[ "$command" != "shell" ]] && detail+="=$command"
+      [[ -n "$model" ]] && detail+="($model)"
+      details+=("$detail")
+    done
+    printf '%-20s %-11s %s\n' "$project" "$state" "${(j:  :)details}"
+  done
+}
+
+# --- Model discovery --------------------------------------------------------
+# Lists the models available to each agent, one per line: `id|nome|efforts`.
+# claude: API oficial com o token OAuth. codex/codex2: models_cache.json do
+# CODEX_HOME correspondente. Cache local de 24h.
+
+readonly MODELS_TTL=86400
+
+models_fetch_claude() {
+  local token
+
+  token="$(claude_oauth_token)" || return 1
+  /usr/bin/curl -sS --max-time 10 "https://api.anthropic.com/v1/models?limit=100" \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "anthropic-version: 2023-06-01" 2>/dev/null \
+    | "$PYTHON_BIN" -c '
+import json, sys
+d = json.load(sys.stdin)
+order = ["low", "medium", "high", "xhigh", "max", "ultra"]
+for m in d.get("data", []):
+    mid = m.get("id", "")
+    if not mid.startswith("claude"):
+        continue
+    name = m.get("display_name", mid)
+    eff = (m.get("capabilities") or {}).get("effort") or {}
+    levels = []
+    if eff.get("supported"):
+        levels = [l for l in order if isinstance(eff.get(l), dict) and eff[l].get("supported")]
+    print(mid + "|" + name + "|" + ",".join(levels))' 2>/dev/null
+}
+
+models_fetch_codex() {
+  local home="$1"
+
+  [[ -r "$home/models_cache.json" ]] || return 1
+  "$PYTHON_BIN" -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+for m in d.get("models", []):
+    slug = m.get("slug", "")
+    if not slug:
+        continue
+    name = m.get("display_name", slug)
+    levels = [l.get("effort", "") for l in m.get("supported_reasoning_levels", []) if l.get("effort")]
+    print(slug + "|" + name + "|" + ",".join(levels))' "$home/models_cache.json" 2>/dev/null
+}
+
+models_fetch_for() {
+  case "$1" in
+    claude) models_fetch_claude ;;
+    codex) models_fetch_codex "$HOME/.codex-personal" ;;
+    codex2) models_fetch_codex "$HOME/.codex-work" ;;
+    *) return 1 ;;
+  esac
+}
+
+models_fallback() {
+  case "$1" in
+    claude)
+      print -r -- "fable|Fable (alias)|low,medium,high,xhigh,max"
+      print -r -- "opus|Opus (alias)|low,medium,high,xhigh,max"
+      print -r -- "sonnet|Sonnet (alias)|low,medium,high,xhigh,max"
+      print -r -- "haiku|Haiku (alias)|"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_models() {
+  local provider="${1:-}"
+  local cache="$USAGE_CACHE_DIR/models-$provider" out now mtime
+
+  case "$provider" in
+    claude|codex|codex2) ;;
+    *) say_error "uso: devworkspace models <claude|codex|codex2>"; return 1 ;;
+  esac
+
+  mkdir -p "$USAGE_CACHE_DIR" 2>/dev/null
+  if [[ -s "$cache" ]]; then
+    now="$(date +%s)"
+    mtime="$(stat -f %m "$cache" 2>/dev/null || print 0)"
+    if (( now - mtime < MODELS_TTL )); then
+      cat "$cache"
+      return 0
+    fi
+  fi
+
+  if out="$(models_fetch_for "$provider")" && [[ -n "$out" ]]; then
+    print -r -- "$out" > "$cache"
+    print -r -- "$out"
+    return 0
+  fi
+  if [[ -s "$cache" ]]; then
+    touch "$cache"
+    cat "$cache"
+    return 0
+  fi
+  models_fallback "$provider"
+}
+
+# Machine-readable state per registered project: `nome|local|tab`.
+# local: ready|not-local · tab: aberto|fundo|fechado. One osascript call total.
+cmd_states() {
+  local project pdir root_pane tab_state
+  local -a open_tabs panes
+
+  load_config || return 1
+  open_tabs=("${(@f)$(open_tab_names)}")
+  for project in "${(@f)$(registered_project_names)}"; do
+    pdir="$(project_path "$project")"
+    if [[ ! -d "$pdir" ]]; then
+      print -r -- "$project|not-local|fechado"
+      continue
+    fi
+    panes=("${(s:,:)$(workspace_panes "$project")}")
+    root_pane="${panes[1]:-shell}"
+    if (( ${open_tabs[(Ie)$project]} )); then
+      tab_state="aberto"
+    elif tmux has-session -t "$(pane_session_name "$project" "$root_pane")" 2>/dev/null; then
+      tab_state="fundo"
+    else
+      tab_state="fechado"
+    fi
+    print -r -- "$project|ready|$tab_state"
+  done
+}
+
+# Regenerates workspaces.zsh from workspaces.json (source of truth for the
+# DevSpaces app).
+cmd_generate() {
+  /usr/bin/python3 "$HOME/devspaces/generate_workspaces.py"
+}
+
+# Registers a folder as a DevSync project (git init if needed). Used by the
+# DevSpaces app "+" button. On success prints ONLY the final name (last line).
+cmd_add_project() {
+  local pdir="$1" nome="${2:-}" line existing_name existing_path
+
+  if [[ -z "$pdir" || ! -d "$pdir" ]]; then
+    say_error "add-project: pasta inválida: ${pdir:-<vazio>}"
+    return 1
+  fi
+  pdir="$(cd "$pdir" 2>/dev/null && pwd)" || {
+    say_error "add-project: não consegui resolver o caminho"
+    return 1
+  }
+  [[ -n "$nome" ]] || nome="${pdir:t}"
+
+  # '|' separa nome|path no registro; ':' ',' espaço quebram sessão tmux
+  if [[ "$nome" == *[\|:,[:space:]]* || "$pdir" == *\|* ]]; then
+    say_error "add-project: nome/caminho não pode conter '|', ':', ',' ou espaço: $nome"
+    return 1
+  fi
+
+  # já registrado? (formato nome|path, '#' comenta)
+  if [[ -r "$HOME/.devsync/projects" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      existing_name="${line%%|*}"
+      existing_path="${line#*|}"
+      if [[ "$existing_name" == "$nome" ]]; then
+        if [[ "$existing_path" == "$pdir" ]]; then
+          print -r -- "já registrado"
+          print -r -- "$nome"
+          return 0
+        fi
+        say_error "add-project: nome '$nome' já registrado com outro caminho: $existing_path"
+        return 1
+      fi
+    done < "$HOME/.devsync/projects"
+  fi
+
+  if [[ ! -d "$pdir/.git" ]]; then
+    /usr/bin/git -C "$pdir" init -q || {
+      say_error "add-project: git init falhou em $pdir"
+      return 1
+    }
+    print -r -- "repo git inicializado em $pdir"
+  fi
+
+  "$HOME/bin/devsync" add "$pdir" --name "$nome" || return $?
+  print -r -- "$nome"
+}
+
+cmd_validate() {
+  local project path missing=0
+
+  load_config || return 1
+  for project in "${(@f)$(registered_project_names)}"; do
+    path="$(project_path "$project")"
+    if [[ ! -d "$path" ]]; then
+      print -r -- "Not available locally: $project ($path)"
+      missing=1
+    fi
+  done
+  print -r -- "DevSync workspace configuration is valid."
+  if (( missing )); then
+    print -r -- "Projects marked not-local will appear automatically when their directories are available."
+  fi
+}
+
+cmd_open() {
+  [[ -x "$GHOSTTY_BIN" ]] || {
+    say_error "Ghostty is not installed at $GHOSTTY_APP"
+    return 1
+  }
+  "$OPEN_BIN" -a Ghostty
+}
+
+cmd_help() {
+  print -r -- "Usage: devworkspace [open|ws|list|validate|usage|edit|config]"
+  print -r -- "  open       abre o Ghostty (que inicia no seletor de workspaces)"
+  print -r -- "  ws <nome>  abre/foca o workspace como aba nativa (atalho: comando 'ws')"
+  print -r -- "  ws         sem nome: seletor rápido inline"
+  print -r -- "  list       mostra workspaces, panes e modelos configurados"
+  print -r -- "  usage      mostra o uso atual (5h/7d) de claude, codex e codex-w"
+  print -r -- "  edit       abre o arquivo de preferências no editor"
+  print -r -- "  validate   confere se a configuração está válida"
+  print -r -- "  add-project <pasta> [nome]  registra a pasta no DevSync (git init se precisar)"
+  print -r -- "Preferences: $WORKSPACE_CONFIG"
+}
+
+# One-shot picker for use inside any shell pane: list, pick, open, return.
+cmd_ws() {
+  local project="$1" key idx
+  local -a projects
+
+  load_config || return 1
+  if [[ -n "$project" ]]; then
+    cmd_open_ws "$project"
+    return $?
+  fi
+  projects=("${(@f)$(registered_project_names)}")
+  local i=0 pdir
+  for project in "${projects[@]}"; do
+    (( i += 1 ))
+    pdir="$(project_path "$project")"
+    if [[ -d "$pdir" ]]; then
+      print -P "  %F{cyan}$i%f  $project"
+    else
+      print -P "  %F{8}$i  $project (não está neste Mac)%f"
+    fi
+  done
+  print -Pn "  workspace: "
+  read -k1 key || return 1
+  print
+  [[ "$key" == [1-9] ]] || return 0
+  project="${projects[$key]:-}"
+  [[ -n "$project" ]] || return 0
+  cmd_open_ws "$project"
+}
+
+case "${1:-open}" in
+  picker) shift; cmd_picker "$@" ;;
+  ws|switch) shift; cmd_ws "$@" ;;
+  bootstrap) shift; cmd_bootstrap "$@" ;;
+  attach-pane) shift; [[ $# -eq 2 ]] || exit 1; cmd_attach_pane "$1" "$2" ;;
+  run-pane) shift; [[ $# -eq 2 ]] || exit 1; cmd_run_pane "$1" "$2" ;;
+  open) shift; cmd_open "$@" ;;
+  prepare) shift; load_config && ensure_workspace_sessions ;;
+  cleanup) shift; load_config && cleanup_stale_sessions ;;
+  list) shift; cmd_list "$@" ;;
+  states) shift; cmd_states "$@" ;;
+  models) shift; cmd_models "$@" ;;
+  generate) shift; cmd_generate "$@" ;;
+  add-project) shift; cmd_add_project "$@" ;;
+  usage) shift; cmd_usage "$@" ;;
+  edit) exec "${EDITOR:-nano}" "$WORKSPACE_CONFIG" ;;
+  validate) shift; cmd_validate "$@" ;;
+  config) print -r -- "$WORKSPACE_CONFIG" ;;
+  help|-h|--help) cmd_help ;;
+  *) say_error "unknown command: $1"; cmd_help; exit 1 ;;
+esac

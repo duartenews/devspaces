@@ -1,0 +1,3 @@
+#!/bin/zsh
+# Abre/foca um workspace do Ghostty. `ws` sozinho lista; `ws pnt` abre direto.
+exec /Users/Raphael/bin/devworkspace ws "$@"
