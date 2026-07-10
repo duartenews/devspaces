@@ -341,6 +341,9 @@ final class Store: ObservableObject {
     /// Aviso discreto no rodapé quando falta permissão de Acessibilidade p/ o tile.
     @Published var accessibilityDenied = false
 
+    /// Aviso quando o Split View ficou aguardando o clique do usuário no seletor.
+    @Published var splitViewNotice: String?
+
     /// true enquanto um sheet (editor ou adicionar pasta) está aberto —
     /// o WindowConfigurator eleva a janela para .floating para o sheet
     /// (520 pt, mais largo que a janela) ficar inteiro por cima do Ghostty.
@@ -362,9 +365,9 @@ final class Store: ObservableObject {
         Task { await self.pollUsage() }
         installObservers()
         if NSApp.isActive { startTimers() }
-        // tile no launch se o Ghostty já estiver rodando (janela ainda nasce → adia)
+        // Split View no launch se o Ghostty já estiver rodando (janela nasce → adia)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            self?.tileNow()
+            self?.arrangeWithGhostty()
         }
     }
 
@@ -417,7 +420,7 @@ final class Store: ObservableObject {
             object: nil, queue: .main) { [weak self] note in
                 guard Self.isGhostty(note) else { return }
                 Task { @MainActor [weak self] in
-                    self?.tileNow()
+                    self?.arrangeWithGhostty()
                     await self?.pollStates()
                 }
             })
@@ -425,7 +428,12 @@ final class Store: ObservableObject {
             forName: NSWorkspace.didTerminateApplicationNotification,
             object: nil, queue: .main) { [weak self] note in
                 guard Self.isGhostty(note) else { return }
-                Task { @MainActor [weak self] in await self?.pollStates() }
+                Task { @MainActor [weak self] in
+                    // Ghostty saiu: se estamos em fullscreen (Split View),
+                    // sai para não ficar preso numa Space vazia
+                    self?.exitSplitViewIfNeeded()
+                    await self?.pollStates()
+                }
             })
     }
 
@@ -485,8 +493,60 @@ final class Store: ObservableObject {
         }
     }
 
-    /// Tenta organizar as janelas. Nunca chamado em loop/polling — só nos
-    /// gatilhos: launch do app, launch do Ghostty, clique que abre workspace.
+    // MARK: Split View nativo
+
+    private var splitViewInProgress = false
+
+    /// Ação principal: entra no SPLIT VIEW NATIVO do macOS (Space própria em
+    /// tela cheia — DevSpaces à esquerda ~300 pt, Ghostty no resto).
+    /// Gatilhos (nunca em polling): launch do app com Ghostty rodando,
+    /// launch do Ghostty, clique que abre workspace.
+    /// Fallback (item de menu do sistema ausente): tiling AX lado a lado.
+    func arrangeWithGhostty() {
+        guard let win = mainWindow else { return }
+        // já em fullscreen (Split View) → nunca re-disparar
+        guard !win.styleMask.contains(.fullScreen) else { return }
+        guard !splitViewInProgress else { return }   // reentrância
+        guard NSRunningApplication
+            .runningApplications(withBundleIdentifier: kGhosttyBundleID)
+            .contains(where: { !$0.isTerminated }) else { return }
+
+        splitViewNotice = nil
+        // janela .floating não entra direito em fullscreen
+        win.level = .normal
+        NSApp.activate()
+        win.makeKeyAndOrderFront(nil)
+
+        // 1) dispara o item de menu do sistema "Full Screen Tile → Left of
+        //    Screen" / "Tela Cheia em Mosaico → Lado Esquerdo da Tela"
+        guard SplitViewDriver.triggerLeftFullScreenTile() else {
+            tileNow()   // fallback: tiling AX lado a lado na mesa
+            return
+        }
+        splitViewInProgress = true
+
+        // 2) o macOS abre o seletor do lado direito (desenhado pelo Dock);
+        //    clica a miniatura do Ghostty via AX — desiste em ~3 s
+        Task { [weak self] in
+            let clicked = await SplitViewDriver.clickGhosttyInSelector()
+            guard let self else { return }
+            self.splitViewInProgress = false
+            self.splitViewNotice = clicked
+                ? nil
+                : "Clique na janela do Ghostty para completar o Split View."
+        }
+    }
+
+    /// Sai do fullscreen quando o Ghostty encerra (senão sobra uma Space vazia).
+    private func exitSplitViewIfNeeded() {
+        splitViewNotice = nil
+        if let win = mainWindow, win.styleMask.contains(.fullScreen) {
+            win.toggleFullScreen(nil)
+        }
+    }
+
+    /// FALLBACK: tiling AX lado a lado na mesa. Também usado se o sistema não
+    /// injetar o item de menu de Split View.
     func tileNow(allowRetry: Bool = true) {
         let win = mainWindow
         switch WindowTiler.tile(appWindow: win) {
@@ -738,8 +798,8 @@ final class Store: ObservableObject {
                     ? "Falha ao abrir o workspace “\(name)” (exit \(res.status))."
                     : msg
             }
-            tileNow()          // gatilho de tile: abriu workspace via clique
-            await pollStates() // refresh por evento
+            arrangeWithGhostty()   // gatilho: abriu workspace via clique
+            await pollStates()     // refresh por evento
         }
     }
 
@@ -938,15 +998,206 @@ enum WindowTiler {
         let rect = NSRect(x: visible.minX + sidebarWidth, y: visible.minY,
                           width: visible.width - sidebarWidth, height: visible.height)
         let primaryHeight = NSScreen.screens.first?.frame.height ?? visible.maxY
-        var position = CGPoint(x: rect.minX, y: primaryHeight - rect.maxY)
-        var size = CGSize(width: rect.width, height: rect.height)
-        if let posValue = AXValueCreate(.cgPoint, &position) {
-            AXUIElementSetAttributeValue(target, kAXPositionAttribute as CFString, posValue)
-        }
-        if let sizeValue = AXValueCreate(.cgSize, &size) {
-            AXUIElementSetAttributeValue(target, kAXSizeAttribute as CFString, sizeValue)
+        if !axSetFrame(target, rect, primaryHeight: primaryHeight) {
+            // divergiu >20 pt na verificação → tenta mais 1 vez
+            _ = axSetFrame(target, rect, primaryHeight: primaryHeight)
         }
         return .done
+    }
+
+    /// Aplica frame via AX com o quirk conhecido — size → position → size DE
+    /// NOVO — e verifica lendo o size de volta (tolerância de 20 pt).
+    /// (Bug corrigido: antes só a posição era aplicada de forma confiável e a
+    /// janela ficava no tamanho original.)
+    private static func axSetFrame(_ element: AXUIElement, _ rect: NSRect,
+                                   primaryHeight: CGFloat) -> Bool {
+        var position = CGPoint(x: rect.minX, y: primaryHeight - rect.maxY)
+        var size = CGSize(width: rect.width, height: rect.height)
+        guard let posValue = AXValueCreate(.cgPoint, &position),
+              let sizeValue = AXValueCreate(.cgSize, &size) else { return false }
+
+        AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
+        AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posValue)
+        AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
+
+        // verificação: lê o size de volta
+        var readRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                  element, kAXSizeAttribute as CFString, &readRef) == .success,
+              let readValue = readRef,
+              CFGetTypeID(readValue) == AXValueGetTypeID()
+        else { return false }
+        var applied = CGSize.zero
+        guard AXValueGetValue(readValue as! AXValue, .cgSize, &applied) else { return false }
+        return abs(applied.width - size.width) <= 20
+            && abs(applied.height - size.height) <= 20
+    }
+}
+
+// MARK: - Split View nativo (menu do sistema + seletor do Dock via AX)
+// Não há API pública para Split View. Estratégia (Sequoia 15.x):
+//   1. Disparar o item que o sistema injeta no menu Window do PRÓPRIO app —
+//      "Full Screen Tile → Left of Screen" (EN) / "Tela Cheia em Mosaico →
+//      Lado Esquerdo da Tela" (PT). Matching flexível por `contains`, EN e PT
+//      (apps não localizados ficam com menus em inglês mesmo em sistema pt-BR).
+//   2. O macOS põe o DevSpaces em fullscreen-esquerda e abre o SELETOR de
+//      janelas do lado direito — desenhado pelo processo Dock. Clicamos a
+//      miniatura do Ghostty via AX (AXPress). Se não achar em ~3 s, desiste
+//      em silêncio: o seletor fica aberto e o usuário completa com 1 clique.
+
+enum SplitViewDriver {
+    // MARK: 1) item de menu (sem AX — é o nosso próprio menu)
+
+    /// Procura recursivamente em NSApp.mainMenu o item de tiling fullscreen
+    /// esquerdo e dispara via sendAction. false = sistema não injetou o item.
+    @MainActor
+    static func triggerLeftFullScreenTile() -> Bool {
+        guard let mainMenu = NSApp.mainMenu else { return false }
+
+        // 1º: pelo submenu "Full Screen Tile" / "Tela Cheia em Mosaico"
+        if let tileMenu = findSubmenu(in: mainMenu, where: { title in
+            (title.contains("full screen") && title.contains("tile"))
+                || title.contains("mosaico")
+        }), let left = tileMenu.items.first(where: { isLeftTileTitle($0.title) }) {
+            return fire(left)
+        }
+        // 2º: busca global pelo próprio item esquerdo
+        if let left = findItem(in: mainMenu, where: { isLeftTileTitle($0.title) }) {
+            return fire(left)
+        }
+        return false
+    }
+
+    private static func isLeftTileTitle(_ title: String) -> Bool {
+        let t = title.lowercased()
+        return t.contains("left of screen") || t.contains("lado esquerdo")
+    }
+
+    @MainActor
+    private static func fire(_ item: NSMenuItem) -> Bool {
+        guard let action = item.action else { return false }
+        // target nil → responder chain (aplica na janela key)
+        return NSApp.sendAction(action, to: item.target, from: nil)
+    }
+
+    private static func findSubmenu(in menu: NSMenu,
+                                    where predicate: (String) -> Bool) -> NSMenu? {
+        for item in menu.items {
+            guard let sub = item.submenu else { continue }
+            if predicate(item.title.lowercased()) || predicate(sub.title.lowercased()) {
+                return sub
+            }
+            if let found = findSubmenu(in: sub, where: predicate) { return found }
+        }
+        return nil
+    }
+
+    private static func findItem(in menu: NSMenu,
+                                 where predicate: (NSMenuItem) -> Bool) -> NSMenuItem? {
+        for item in menu.items {
+            if predicate(item) { return item }
+            if let sub = item.submenu,
+               let found = findItem(in: sub, where: predicate) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    // MARK: 2) seletor do Split View (processo Dock, via AX)
+
+    /// Espera o seletor abrir (~1 s) e tenta AXPress na miniatura do Ghostty
+    /// por até ~3 s. Roda inteiro em background — nunca bloqueia a main thread.
+    static func clickGhosttyInSelector() async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                Thread.sleep(forTimeInterval: 1.0)   // seletor abrindo
+                let deadline = Date().addingTimeInterval(3.0)
+                var pressed = false
+                while Date() < deadline {
+                    if pressGhosttyThumbnail() {
+                        pressed = true
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.7)
+                }
+                cont.resume(returning: pressed)
+            }
+        }
+    }
+
+    /// Varre só as JANELAS do Dock (o seletor é uma janela dele; assim não
+    /// encostamos nos ícones do Dock em si) atrás de um elemento clicável cujo
+    /// título/descrição contenha "Ghostty", e dá AXPress nele (ou no pai).
+    private static func pressGhosttyThumbnail() -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+        guard let dock = NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.dock").first
+        else { return false }
+
+        let dockApp = AXUIElementCreateApplication(dock.processIdentifier)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                  dockApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement], !windows.isEmpty
+        else { return false }
+
+        var stack: [AXUIElement] = windows
+        var visited = 0
+        while let element = stack.popLast() {
+            visited += 1
+            if visited > 4000 { break }   // teto de segurança na árvore AX
+            let role = axString(element, kAXRoleAttribute) ?? ""
+            if !role.contains("DockItem"), mentionsGhostty(element) {
+                if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
+                    return true
+                }
+                // alguns seletores só aceitam o press no contêiner (AXGroup)
+                if let parent = axElement(element, kAXParentAttribute),
+                   AXUIElementPerformAction(parent, kAXPressAction as CFString) == .success {
+                    return true
+                }
+            }
+            stack.append(contentsOf: axChildren(element))
+        }
+        return false
+    }
+
+    private static func mentionsGhostty(_ element: AXUIElement) -> Bool {
+        for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
+            if let text = axString(element, attribute),
+               text.lowercased().contains("ghostty") {
+                return true
+            }
+        }
+        return false
+    }
+
+    // MARK: helpers AX
+
+    private static func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                  element, kAXChildrenAttribute as CFString, &ref) == .success,
+              let children = ref as? [AXUIElement] else { return [] }
+        return children
+    }
+
+    private static func axString(_ element: AXUIElement, _ attribute: String) -> String? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                  element, attribute as CFString, &ref) == .success else { return nil }
+        return ref as? String
+    }
+
+    private static func axElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                  element, attribute as CFString, &ref) == .success,
+              let value = ref,
+              CFGetTypeID(value) == AXUIElementGetTypeID()
+        else { return nil }
+        return (value as! AXUIElement)
     }
 }
 
@@ -995,7 +1246,17 @@ struct WindowConfigurator: NSViewRepresentable {
         if window.frameAutosaveName != "DevSpacesMain" {
             window.setFrameAutosaveName("DevSpacesMain")
         }
-        window.level = floatOnTop ? .floating : .normal
+        // Split View nativo: permite tiling fullscreen e trava a largura em
+        // 300–340 pt (altura livre) — assim o divisor do Split View dá ~300 pt
+        // pro DevSpaces e todo o resto pro Ghostty. Os sheets (520 pt) são
+        // janelas próprias e não são afetados pelo contentMaxSize.
+        window.collectionBehavior.insert(.fullScreenAllowsTiling)
+        window.contentMinSize = NSSize(width: 300, height: 400)
+        window.contentMaxSize = NSSize(width: 340, height: CGFloat.greatestFiniteMagnitude)
+        // .floating não combina com fullscreen: dentro do Split View não há
+        // Ghostty por cima, então o level fica .normal lá.
+        let isFullScreen = window.styleMask.contains(.fullScreen)
+        window.level = (floatOnTop && !isFullScreen) ? .floating : .normal
         window.titlebarAppearsTransparent = true
     }
 }
@@ -1176,6 +1437,13 @@ struct ContentView: View {
                       systemImage: "exclamationmark.triangle")
                     .font(.system(size: 10))
                     .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let notice = store.splitViewNotice {
+                Label(notice, systemImage: "rectangle.split.2x1")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
